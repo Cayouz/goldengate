@@ -184,7 +184,8 @@ input,select,textarea{font-family:inherit}
 .nav-children{display:none;margin:0 0 7px 12px;padding:2px 0 2px 10px;border-left:1px solid rgba(148,163,184,.14)}
 .nav-group.open .nav-children{display:block}
 .nav-children .nav-item{padding-left:12px}
-.side-user{padding:14px 16px;border-top:1px solid var(--line);display:flex;align-items:center;gap:11px;flex-shrink:0}
+.side-user{padding:14px 16px;border-top:1px solid var(--line);display:flex;align-items:center;gap:11px;flex-shrink:0;cursor:pointer;transition:.18s}
+.side-user:hover{background:rgba(255,255,255,.05)}
 .side-avatar{width:38px;height:38px;border-radius:50%;background:rgba(56,189,248,.15);color:var(--brand);display:grid;place-items:center;font-weight:800;font-size:15px}
 .side-user b{display:block;font-size:13px}
 .side-user span{color:var(--muted);font-size:11px}
@@ -389,7 +390,7 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
   .login-btn{font-size:17px}
 }
   .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:9999}
-  .modal-card{background:var(--card);border-radius:16px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.4);width:min(440px,92vw)}
+  .modal-card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.4);width:min(440px,92vw)}
 </style>
 </head>
 <body>
@@ -471,6 +472,7 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
 </div>
 
 <div id="toast"></div>
+<div id="profileModal" class="modal-overlay" style="display:none"><div class="modal-card" style="max-width:400px" id="profileCard"></div></div>
 
 <script>
 "use strict";
@@ -1841,6 +1843,71 @@ function navigate(view, param) {
   renderMain();
 }
 
+function openProfile(u) {
+  const modal = document.getElementById("profileModal");
+  const closeModal = () => { modal.style.display = "none"; };
+  if (u.role === "teacher" || u.role === "student") {
+    const row = (label, value) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13.5px"><span style="color:var(--muted)">${label}</span><b style="text-align:right">${esc(value || "—")}</b></div>`;
+    let extra = "";
+    if (u.role === "teacher" && u.refId) {
+      const t = db.teachers.find(x => x.id === u.refId);
+      if (t) extra = row("Fan", t.subject) + row("Telefon", t.phone) + row("Guruhlar", db.groups.filter(g => g.teacherId === t.id).length + " ta");
+    } else if (u.role === "student" && u.refId) {
+      const s = db.students.find(x => x.id === u.refId);
+      if (s) {
+        const gnames = (s.groupIds || []).map(gid => { const g = db.groups.find(x => x.id === gid); return g ? g.name : ""; }).filter(Boolean).join(", ");
+        extra = row("Telefon", s.phone) + row("Guruhlar", gnames) + row("Qarz", fmtMoney(debtOf(s.id)));
+      }
+    }
+    document.getElementById("profileCard").innerHTML = `
+      <div style="text-align:center;margin-bottom:18px">
+        <div class="side-avatar" style="width:64px;height:64px;font-size:26px;margin:0 auto 12px">${esc((u.name || "?").trim().charAt(0).toUpperCase())}</div>
+        <h3 style="margin:0 0 8px">${esc(u.name)}</h3>
+        <span class="badge ${ROLE_PILL[u.role] || "info"}">${esc(ROLE_LABEL[u.role] || u.role)}</span>
+      </div>
+      ${row("Login", u.login)}
+      ${extra}
+      <div style="display:flex;justify-content:flex-end;margin-top:18px"><button class="btn sm" id="closeProfile">Yopish</button></div>`;
+    modal.style.display = "flex";
+    document.getElementById("closeProfile").onclick = closeModal;
+    modal.onclick = e => { if (e.target === modal) closeModal(); };
+    return;
+  }
+  document.getElementById("profileCard").innerHTML = `
+    <div style="text-align:center;margin-bottom:18px">
+      <div class="side-avatar" style="width:64px;height:64px;font-size:26px;margin:0 auto 12px" id="pfAvatar">${esc((u.name || "?").trim().charAt(0).toUpperCase())}</div>
+      <span class="badge ${ROLE_PILL[u.role] || "info"}">${esc(ROLE_LABEL[u.role] || u.role)}</span>
+    </div>
+    ${field("F.I.O", `<input id="pfName" required value="${esc(u.name || "")}">`)}
+    ${field("Login", `<input id="pfLogin" required value="${esc(u.login)}">`)}
+    ${field("Yangi parol", `<input id="pfPass" type="password" placeholder="o'zgartirmaslik uchun bo'sh qoldiring" autocomplete="new-password">`)}
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px"><button class="btn sm" id="closeProfile">Yopish</button><button class="btn sm gold" id="saveProfile">Saqlash</button></div>`;
+  modal.style.display = "flex";
+  document.getElementById("pfName").addEventListener("input", e => {
+    document.getElementById("pfAvatar").textContent = (e.target.value || "?").trim().charAt(0).toUpperCase() || "?";
+  });
+  document.getElementById("closeProfile").onclick = closeModal;
+  modal.onclick = e => { if (e.target === modal) closeModal(); };
+  document.getElementById("saveProfile").onclick = () => {
+    const name = document.getElementById("pfName").value.trim();
+    if (!name) { toast("F.I.O kiritilishi shart", "err"); return; }
+    const login = document.getElementById("pfLogin").value.trim();
+    if (!login) { toast("Login kiritilishi shart", "err"); return; }
+    if (db.users.some(x => x.id !== u.id && x.login === login)) { toast("Bu login band, boshqa login kiriting", "err"); return; }
+    const pass = document.getElementById("pfPass").value;
+    if (pass && pass.length < 4) { toast("Parol kamida 4 belgidan iborat bo'lishi kerak", "err"); return; }
+    u.name = name;
+    u.login = login;
+    if (pass) u.pass = pass;
+    audit("Tahrirlandi", "users", u.login + " o'z profilini yangiladi");
+    saveDB();
+    document.getElementById("sideAvatar").textContent = (u.name || "?").trim().charAt(0).toUpperCase();
+    document.getElementById("sideName").textContent = u.name;
+    closeModal();
+    toast("Profil saqlandi");
+  };
+}
+
 function renderMain() {
   const u = currentUser();
   if (!u) return;
@@ -1892,6 +1959,7 @@ function renderMain() {
   document.getElementById("sideAvatar").textContent = (u.name || "?").trim().charAt(0).toUpperCase();
   document.getElementById("sideName").textContent = u.name;
   document.getElementById("sideRole").textContent = ROLE_LABEL[u.role] || u.role;
+  document.querySelector(".side-user").onclick = () => openProfile(u);
 
   /* content */
   const fn = VIEWS[currentView];
