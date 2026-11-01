@@ -161,6 +161,13 @@ input,select,textarea{font-family:inherit}
 .topbar-left{display:flex;align-items:center;gap:12px}
 .topbar-left b{font-size:15.5px;letter-spacing:-.2px}
 .topbar-right{display:flex;align-items:center;gap:12px}
+.sync-pill{
+  padding:6px 11px;border-radius:999px;font-size:11.5px;font-weight:800;white-space:nowrap;
+  background:rgba(255,255,255,.04);color:var(--muted);border:1px solid var(--line);
+}
+.sync-pill.sync{color:var(--brand);border-color:rgba(56,189,248,.35);background:rgba(56,189,248,.08)}
+.sync-pill.ok{color:var(--success);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
+.sync-pill.err{color:var(--danger);border-color:rgba(251,113,133,.35);background:rgba(251,113,133,.08)}
 .role-pill{
   padding:7px 14px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.4px;
   background:rgba(56,189,248,.12);color:var(--brand);border:1px solid rgba(56,189,248,.3);
@@ -497,6 +504,7 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
         <b>Golden Gate LC</b>
       </div>
       <div class="topbar-right">
+        <span class="sync-pill" id="syncPill" title="Bulut sinxronlash holati">☁ Lokal</span>
         <span class="top-date" id="topDate"></span>
         <span class="role-pill" id="rolePill"></span>
         <button class="btn-logout" id="logoutBtn">Chiqish</button>
@@ -530,12 +538,51 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
 const DB_KEY = "gglc_db_v1";
 const DB_BACKUP_KEY = "gglc_db_v1_backup";
 const SESSION_KEY = "gglc_session";
+const SYNC_KEY = "gglc_sync_cfg";
 
 let db = null;
 let session = null;      // {userId}
 let currentView = "";
 let openNavGroup = "";
 let navGroupInitDone = false;
+
+/* ================================================================
+   BULUT SINXRONLASH (Supabase)
+   Barcha qurilmalarda bir xil ma'lumot bo'lishi uchun quyidagi
+   url va anonKey ni to'ldiring. Bo'sh qolsa — tizim avvalgidek
+   faqat shu qurilma xotirasida ishlaydi.
+================================================================ */
+const SYNC_CFG = {
+  url: "https://xmigujsvqkekrhakrddz.supabase.co",
+  anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhtaWd1anN2cWtla3JoYWtyZGR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTM1NDc0MTUsImV4cCI6MjEwOTEyMzQxNX0.fyU48vImsSw9c3MujPEs5QY7RlF-G48KBb26Zz7fiQU",
+  table: "gglc_data",
+  id: "main",
+};
+const SYNC_ON = () => !!(SYNC_CFG.url && SYNC_CFG.anonKey);
+let syncReady = false;
+let syncBusy = false;
+let cloudPushTimer = null;
+let cloudLoopStarted = false;
+
+function loadSyncCfg() {
+  try {
+    const raw = localStorage.getItem(SYNC_KEY);
+    if (!raw) return;
+    const c = JSON.parse(raw);
+    if (c && c.url) SYNC_CFG.url = String(c.url).trim().replace(/\/$/, "");
+    if (c && c.anonKey) SYNC_CFG.anonKey = String(c.anonKey).trim();
+  } catch (e) {}
+}
+function saveSyncCfg(url, key) {
+  SYNC_CFG.url = String(url || "").trim().replace(/\/$/, "");
+  SYNC_CFG.anonKey = String(key || "").trim();
+  try { localStorage.setItem(SYNC_KEY, JSON.stringify({ url: SYNC_CFG.url, anonKey: SYNC_CFG.anonKey })); } catch (e) {}
+}
+function clearSyncCfg() {
+  SYNC_CFG.url = "";
+  SYNC_CFG.anonKey = "";
+  try { localStorage.removeItem(SYNC_KEY); } catch (e) {}
+}
 
 /* ---------------- utilities ---------------- */
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -557,18 +604,9 @@ function seedDB() {
     settings: { centerName: "Golden Gate LC", phone: "", address: "", currency: "so'm" },
   };
 }
-function loadDB() {
+function normalizeDB(raw) {
   const fresh = seedDB();
-  let data = null;
-  for (const key of [DB_KEY, DB_BACKUP_KEY]) {
-    try {
-      const raw = localStorage.getItem(key);
-      if (!raw) continue;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") { data = parsed; break; }
-    } catch (e) {}
-  }
-  if (!data) data = fresh;
+  const data = raw && typeof raw === "object" ? raw : fresh;
   Object.keys(fresh).forEach(k => {
     if (data[k] === undefined) data[k] = fresh[k];
   });
@@ -587,9 +625,22 @@ function loadDB() {
   }
   return data;
 }
+function loadDB() {
+  let data = null;
+  for (const key of [DB_KEY, DB_BACKUP_KEY]) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") { data = parsed; break; }
+    } catch (e) {}
+  }
+  return normalizeDB(data);
+}
 let lastBackupAt = 0;
-function saveDB(forceBackup) {
+function saveDB(forceBackup, skipCloud) {
   if (!db) return;
+  if (!skipCloud) db.updatedAt = new Date().toISOString();
   try {
     const raw = JSON.stringify(db);
     localStorage.setItem(DB_KEY, raw);
@@ -600,6 +651,7 @@ function saveDB(forceBackup) {
   } catch (e) {
     toast("Ma'lumotni saqlashda xatolik — brauzer xotirasi to'lgan bo'lishi mumkin", "err");
   }
+  if (!skipCloud) scheduleCloudPush();
 }
 function saveSession(s) {
   session = s;
@@ -618,6 +670,155 @@ function readSession() {
   }
   return null;
 }
+
+/* ---------------- bulut sinxronlash ---------------- */
+function setSyncState(kind, text) {
+  const el = document.getElementById("syncPill");
+  if (!el) return;
+  el.className = "sync-pill" + (kind ? " " + kind : "");
+  el.textContent = text;
+}
+function syncHeaders() {
+  return { apikey: SYNC_CFG.anonKey, Authorization: "Bearer " + SYNC_CFG.anonKey, "Content-Type": "application/json" };
+}
+function cloudUrl(query) {
+  return `${SYNC_CFG.url.replace(/\/$/, "")}/rest/v1/${SYNC_CFG.table}${query || ""}`;
+}
+function adoptRemote(data) {
+  db = normalizeDB(data);
+  saveDB(false, true);
+  if (session && !db.users.some(u => u.id === session.userId)) {
+    clearSession();
+    document.getElementById("appScreen").classList.remove("show");
+    document.getElementById("loginScreen").style.display = "grid";
+    return;
+  }
+  if (session) renderMain();
+}
+async function cloudFetchRow() {
+  const res = await fetch(cloudUrl(`?id=eq.${encodeURIComponent(SYNC_CFG.id)}&select=*`), { headers: syncHeaders(), cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const rows = await res.json();
+  return rows && rows[0] ? rows[0] : null;
+}
+async function cloudPush() {
+  if (!SYNC_ON() || !db) return false;
+  setSyncState("sync", "☁ Saqlanmoqda…");
+  try {
+    if (!db.updatedAt) db.updatedAt = new Date().toISOString();
+    const res = await fetch(cloudUrl(), {
+      method: "POST",
+      headers: { ...syncHeaders(), Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([{ id: SYNC_CFG.id, data: db, updated_at: db.updatedAt }]),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    setSyncState("ok", "☁ Saqlandi");
+    return true;
+  } catch (e) {
+    setSyncState("err", "☁ Saqlanmadi");
+    return false;
+  }
+}
+function uiBusyForSync() {
+  const ae = document.activeElement;
+  if (ae && /^(INPUT|SELECT|TEXTAREA|OPTION)$/.test(ae.tagName) && ae.offsetParent !== null) return true;
+  for (const el of document.querySelectorAll(".modal-overlay")) {
+    if (el.offsetParent !== null && getComputedStyle(el).display !== "none") return true;
+  }
+  const eum = document.getElementById("editUserModal");
+  if (eum && getComputedStyle(eum).display !== "none") return true;
+  return false;
+}
+async function cloudPull() {
+  if (!SYNC_ON() || !db || syncBusy) return "skip";
+  syncBusy = true;
+  try {
+    const row = await cloudFetchRow();
+    if (!row || !row.data) return "empty";
+    const remoteTs = Date.parse(row.data.updatedAt || row.updated_at || 0) || 0;
+    const localTs = Date.parse(db.updatedAt || 0) || 0;
+    if (remoteTs > localTs) {
+      if (uiBusyForSync()) return "behind";
+      adoptRemote(row.data);
+      setSyncState("ok", "☁ Yangilandi");
+      return "adopted";
+    }
+    return remoteTs === localTs ? "equal" : "local-newer";
+  } catch (e) {
+    setSyncState("err", "☁ Ulanmadi");
+    return "error";
+  } finally {
+    syncBusy = false;
+  }
+}
+async function cloudSyncNow() {
+  if (!SYNC_ON() || !syncReady) return;
+  const result = await cloudPull();
+  if (result === "local-newer" || result === "empty") await cloudPush();
+}
+function scheduleCloudPush() {
+  if (!SYNC_ON() || !syncReady) return;
+  clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(() => { cloudSyncNow(); }, 1500);
+}
+async function cloudBootstrap() {
+  if (!SYNC_ON()) { syncReady = true; setSyncState("", "Lokal"); return; }
+  setSyncState("sync", "☁ Ulanmoqda…");
+  const meaningful = d => ["students","groups","teachers","payments","attendance","employees","admissions","homeworks"].reduce((n, k) => n + (Array.isArray(d[k]) ? d[k].length : 0), 0);
+  /* bulutga ulanmagan eski qurilmadagi ma'lumot vaqt belgisisiz bo'lsa — uni yangi deb hisoblaymiz */
+  if (meaningful(db) > 0 && !db.updatedAt) {
+    db.updatedAt = new Date().toISOString();
+    saveDB(false, true);
+  }
+  try {
+    const row = await cloudFetchRow();
+    if (!row || !row.data) {
+      syncReady = true;
+      if (!db.updatedAt) db.updatedAt = new Date().toISOString();
+      saveDB(false, true);
+      await cloudPush();
+      return;
+    }
+    const remoteTs = Date.parse(row.data.updatedAt || row.updated_at || 0) || 0;
+    const localTs = Date.parse(db.updatedAt || 0) || 0;
+    const mDb = meaningful(db), mRemote = meaningful(row.data);
+    if (mDb === 0 && mRemote > 0) {
+      syncReady = true;
+      adoptRemote(row.data);
+      setSyncState("ok", "☁ Yangilandi");
+      return;
+    }
+    /* bulutda bo'sh ma'lumot bo'lsa, qurilmadagi ma'lumotni bosib ketmasin */
+    if (mRemote === 0 && mDb > 0) {
+      syncReady = true;
+      await cloudPush();
+      return;
+    }
+    syncReady = true;
+    if (remoteTs > localTs) {
+      adoptRemote(row.data);
+      setSyncState("ok", "☁ Yangilandi");
+    } else if (localTs > remoteTs) {
+      await cloudPush();
+    } else {
+      setSyncState("ok", "☁ Sinxron");
+    }
+  } catch (e) {
+    syncReady = true;
+    setSyncState("err", "☁ Ulanmadi");
+  }
+}
+function startCloudLoop() {
+  if (!SYNC_ON() || cloudLoopStarted) return;
+  cloudLoopStarted = true;
+  setInterval(() => {
+    if (!syncReady || document.visibilityState !== "visible") return;
+    cloudSyncNow();
+  }, 20000);
+  window.addEventListener("focus", () => { if (syncReady) cloudSyncNow(); });
+  document.addEventListener("visibilitychange", () => { if (syncReady && document.visibilityState === "visible") cloudSyncNow(); });
+}
+
 function audit(action, table, detail = "", amount = 0) {
   if (!db || !Array.isArray(db.audit)) return;
   const user = session && db.users.find(u => u.id === session.userId);
@@ -1556,8 +1757,42 @@ VIEWS.deleted = () => head("O'chirilganlar", "O'chirilgan yozuvlarni tiklash") +
 BINDS.deleted = () => document.querySelectorAll("[data-restore]").forEach(b=>b.addEventListener("click",()=>{const d=db.deleted.find(x=>x.id===b.dataset.restore);if(!d||!Array.isArray(db[d.table]))return toast("Tiklab bo'lmaydi","err");db[d.table].push(d.item);db.deleted=db.deleted.filter(x=>x.id!==d.id);audit("Tiklandi",d.table,d.item.name||d.item.title||"Yozuv");saveDB();toast("Yozuv tiklandi");renderMain()}));
 VIEWS["login-history"] = () => head("Kirish tarixi", "Tizimga kirish urinishlari") + `<div class="card">${db.loginHistory.length?`<div style="display:flex;justify-content:flex-end;margin-bottom:12px"><button class="btn sm" id="btnClearLoginHistory" style="background:#e74c3c;color:#fff">Barchasini o'chirish</button></div><table class="tbl"><thead><tr><th>Vaqt</th><th>Login</th><th>Foydalanuvchi</th><th>Natija</th><th></th></tr></thead><tbody>${db.loginHistory.map(x=>`<tr><td>${new Date(x.at).toLocaleString("uz-UZ")}</td><td>${esc(x.login)}</td><td>${esc(x.name||"—")}</td><td><span class="badge ${(x.ok??x.success)?"ok":"bad"}">${(x.ok??x.success)?"Muvaffaqiyatli":"Xato"}</span></td><td><button class="del-btn" data-del-login="${x.id}" title="O'chirish"></button></td></tr>`).join("")}</tbody></table>`:empty("◴","Kirish tarixi bo'sh.")}</div>`;
 BINDS["login-history"] = () => { document.querySelectorAll("[data-del-login]").forEach(b => b.addEventListener("click", () => { db.loginHistory = db.loginHistory.filter(x => x.id !== b.dataset.delLogin); saveDB(); renderMain(); })); const clearBtn = document.getElementById("btnClearLoginHistory"); if (clearBtn) clearBtn.addEventListener("click", () => { if (!confirm("Barcha kirish tarixi o'chiriladi. Davom etasizmi?")) return; db.loginHistory = []; saveDB(); toast("Kirish tarixi tozalandi"); renderMain(); }); };
-VIEWS.settings = () => head("Sozlamalar", "O'quv markazi asosiy sozlamalari") + `<div class="card"><form class="form-grid" id="settingsForm">${field("Markaz nomi",`<input id="setName" value="${esc(db.settings.centerName)}" required>`)}${field("Telefon",`<input id="setPhone" value="${esc(db.settings.phone)}">`)}${field("Manzil",`<input id="setAddress" value="${esc(db.settings.address)}">`)}${field("Valyuta",`<input id="setCurrency" value="${esc(db.settings.currency)}" required>`)}<button class="btn gold">Saqlash</button></form></div><div class="card" style="border-left:4px solid #e74c3c"><h3>🗑 Ma'lumotlarni tozalash</h3><p style="color:#8892a4;margin:0 0 12px">Barcha o'quvchilar, o'qituvchilar, guruhlar, vazifalar, to'lovlar va davomat ma'lumotlarini o'chiradi. Faqat admin va boss foydalanuvchilari saqlanib qoladi.</p><button class="btn sm" id="btnResetAll" style="background:#e74c3c;color:#fff">Barcha ma'lumotlarni o'chirish</button></div>`;
-BINDS.settings = () => { bindForm("settingsForm",f=>{db.settings.centerName=f.setName.value.trim();db.settings.phone=f.setPhone.value.trim();db.settings.address=f.setAddress.value.trim();db.settings.currency=f.setCurrency.value.trim();audit("O'zgartirildi","settings","Markaz sozlamalari");saveDB();toast("Sozlamalar saqlandi")}); const resetBtn = document.getElementById("btnResetAll"); if (resetBtn) resetBtn.addEventListener("click", () => { if (!confirm("Barcha ma'lumotlar o'chiriladi! O'quvchilar, o'qituvchilar, guruhlar, vazifalar, to'lovlar — hammasi yo'qoladi. Davom etasizmi?")) return; const keepUsers = db.users.filter(u => u.role === "admin" || u.role === "boss"); db.teachers = []; db.students = []; db.groups = []; db.homework = []; db.attendance = []; db.payments = []; db.subjects = []; db.rooms = []; db.employees = []; db.teacherSubjects = []; db.admissions = []; db.tasks = []; db.calls = []; db.messages = []; db.expenseTypes = []; db.expenses = []; db.salaries = []; db.advances = []; db.savedReports = []; db.audit = []; db.deleted = []; db.loginHistory = []; db.users = keepUsers; saveDB(); toast("Barcha ma'lumotlar o'chirildi"); renderMain(); }); };
+VIEWS.settings = () => head("Sozlamalar", "O'quv markazi asosiy sozlamalari") + `<div class="card"><form class="form-grid" id="settingsForm">${field("Markaz nomi",`<input id="setName" value="${esc(db.settings.centerName)}" required>`)}${field("Telefon",`<input id="setPhone" value="${esc(db.settings.phone)}">`)}${field("Manzil",`<input id="setAddress" value="${esc(db.settings.address)}">`)}${field("Valyuta",`<input id="setCurrency" value="${esc(db.settings.currency)}" required>`)}<button class="btn gold">Saqlash</button></form></div><div class="card" style="border-left:4px solid #3b82f6"><h3>☁ Bulut sinxronlash</h3><p style="color:#8892a4;margin:0 0 12px">Bir qurilmada kiritilgan ma'lumotlar boshqa barcha qurilmalarda ham ko'rinishi uchun Supabase loyihangizni ulang. Urlsiz tizim faqat shu qurilma xotirasida ishlaydi.</p><div class="form-grid">${field("Project URL",`<input id="syncUrl" placeholder="https://abcdxyz.supabase.co" value="${esc(SYNC_CFG.url)}">`)}${field("Anon key",`<input id="syncKey" placeholder="eyJhbGciOiJIUzI1NiIs…" value="${esc(SYNC_CFG.anonKey)}">`)}</div><p style="color:${SYNC_ON() ? "#4ade80" : "#8892a4"};margin:8px 0 0;font-size:13px">Holat: ${SYNC_ON() ? "ulangan — " + esc(SYNC_CFG.url.replace(/^https?:\/\//, "")) : "ulanmagan"}</p><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><button class="btn sm gold" id="btnSyncConnect">${SYNC_ON() ? "Qayta ulash" : "Ulash"}</button><button class="btn sm ghost" id="btnSyncPull">Bulutdan yangilash</button><button class="btn sm" id="btnSyncDisconnect" style="background:#e74c3c;color:#fff">Uzish</button></div></div><div class="card" style="border-left:4px solid #e74c3c"><h3>🗑 Ma'lumotlarni tozalash</h3><p style="color:#8892a4;margin:0 0 12px">Barcha o'quvchilar, o'qituvchilar, guruhlar, vazifalar, to'lovlar va davomat ma'lumotlarini o'chiradi. Faqat admin va boss foydalanuvchilari saqlanib qoladi.</p><button class="btn sm" id="btnResetAll" style="background:#e74c3c;color:#fff">Barcha ma'lumotlarni o'chirish</button></div>`;
+BINDS.settings = () => { bindForm("settingsForm",f=>{db.settings.centerName=f.setName.value.trim();db.settings.phone=f.setPhone.value.trim();db.settings.address=f.setAddress.value.trim();db.settings.currency=f.setCurrency.value.trim();audit("O'zgartirildi","settings","Markaz sozlamalari");saveDB();toast("Sozlamalar saqlandi")}); const resetBtn = document.getElementById("btnResetAll"); if (resetBtn) resetBtn.addEventListener("click", () => { if (!confirm("Barcha ma'lumotlar o'chiriladi! O'quvchilar, o'qituvchilar, guruhlar, vazifalar, to'lovlar — hammasi yo'qoladi. Davom etasizmi?")) return; const keepUsers = db.users.filter(u => u.role === "admin" || u.role === "boss"); db.teachers = []; db.students = []; db.groups = []; db.homework = []; db.attendance = []; db.payments = []; db.subjects = []; db.rooms = []; db.employees = []; db.teacherSubjects = []; db.admissions = []; db.tasks = []; db.calls = []; db.messages = []; db.expenseTypes = []; db.expenses = []; db.salaries = []; db.advances = []; db.savedReports = []; db.audit = []; db.deleted = []; db.loginHistory = []; db.users = keepUsers; saveDB(); toast("Barcha ma'lumotlar o'chirildi"); renderMain(); });
+
+  const syncConnect = document.getElementById("btnSyncConnect");
+  if (syncConnect) syncConnect.addEventListener("click", async () => {
+    const u = (document.getElementById("syncUrl").value || "").trim();
+    const k = (document.getElementById("syncKey").value || "").trim();
+    if (!/^https?:\/\/.+/.test(u) || !k) return toast("Project URL va anon key kiriting", "err");
+    saveSyncCfg(u, k);
+    syncReady = false;
+    startCloudLoop();
+    await cloudBootstrap();
+    toast(SYNC_ON() ? "Bulutga ulandi" : "Ulashda xatolik", SYNC_ON() ? "ok" : "err");
+    renderMain();
+  });
+  const syncPullBtn = document.getElementById("btnSyncPull");
+  if (syncPullBtn) syncPullBtn.addEventListener("click", async () => {
+    if (!SYNC_ON()) return toast("Avval bulutga ulang", "err");
+    setSyncState("sync", "☁ Tekshirilmoqda…");
+    const r = await cloudPull();
+    if (r === "adopted") { toast("Bulutdagi ma'lumotlar yuklandi"); renderMain(); }
+    else if (r === "empty") { await cloudPush(); toast("Bulutda ma'lumot yo'q edi — hozirgi ma'lumot yuborildi"); }
+    else if (r === "behind") toast("Hozir tahrirlash jarayonidasiz — keyinroq urinib ko'ring", "err");
+    else if (r === "equal" || r === "local-newer") { setSyncState("ok", "☁ Sinxron"); toast("Ma'lumotlar eng so'nggi holatda"); }
+    else toast("Ulanib bo'lmadi — URL va anon keyni tekshiring", "err");
+  });
+  const syncOffBtn = document.getElementById("btnSyncDisconnect");
+  if (syncOffBtn) syncOffBtn.addEventListener("click", () => {
+    if (!confirm("Bulut bilan ulanish uziladi. Bu qurilmadagi ma'lumotlar o'chmaydi. Davom etasizmi?")) return;
+    clearSyncCfg();
+    syncReady = false;
+    setSyncState("", "Lokal");
+    toast("Bulut ulanishi uzildi");
+    renderMain();
+  });
+};
 
 /* delete cascade */
 function bindDeletes() {
@@ -2321,8 +2556,11 @@ function logout() {
 
 /* ---------------- init ---------------- */
 function init() {
+  loadSyncCfg();
   db = loadDB();
-  saveDB(true);
+  saveDB(true, true);
+  cloudBootstrap();
+  startCloudLoop();
 
   document.getElementById("loginBtn").addEventListener("click", attemptLogin);
   document.getElementById("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") attemptLogin(); });
@@ -2334,9 +2572,13 @@ function init() {
   document.getElementById("logoutBtn").addEventListener("click", logout);
 
   /* ma'lumotlarni sahifa yopilishida ham saqlab qolish */
-  window.addEventListener("pagehide", () => { if (db) saveDB(); });
-  window.addEventListener("beforeunload", () => { if (db) saveDB(); });
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && db) saveDB(); });
+  window.addEventListener("pagehide", () => { if (db) saveDB(false, true); });
+  window.addEventListener("beforeunload", () => { if (db) saveDB(false, true); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "hidden" || !db) return;
+    saveDB(false, true);
+    if (SYNC_ON() && syncReady) cloudSyncNow();
+  });
 
   /* auto-login from session */
   try {
