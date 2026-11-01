@@ -528,12 +528,14 @@ table.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
    faqat admin va boss hisoblari bor, qolgan hamma narsa 0.
 ================================================================ */
 const DB_KEY = "gglc_db_v1";
+const DB_BACKUP_KEY = "gglc_db_v1_backup";
 const SESSION_KEY = "gglc_session";
 
 let db = null;
 let session = null;      // {userId}
 let currentView = "";
 let openNavGroup = "";
+let navGroupInitDone = false;
 
 /* ---------------- utilities ---------------- */
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -557,17 +559,65 @@ function seedDB() {
 }
 function loadDB() {
   const fresh = seedDB();
-  let data = fresh;
-  try { const raw = localStorage.getItem(DB_KEY); if (raw) data = JSON.parse(raw); } catch (e) {}
+  let data = null;
+  for (const key of [DB_KEY, DB_BACKUP_KEY]) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") { data = parsed; break; }
+    } catch (e) {}
+  }
+  if (!data) data = fresh;
   Object.keys(fresh).forEach(k => {
     if (data[k] === undefined) data[k] = fresh[k];
   });
   data.settings = { ...fresh.settings, ...(data.settings || {}) };
   if (Array.isArray(data.users)) data.users.forEach(u => { if (u.pass) u.pass = u.pass.trim(); if (u.login) u.login = u.login.trim().toLowerCase(); if (u.firstName === undefined) u.firstName = u.name || ""; if (u.lastName === undefined) u.lastName = ""; if (u.photo === undefined) u.photo = null; });
-  if (Array.isArray(data.students)) data.students.forEach(s => { if (s.groupId !== undefined && !Array.isArray(s.groupIds)) { s.groupIds = s.groupId ? [s.groupId] : []; delete s.groupId; } else if (!Array.isArray(s.groupIds)) { s.groupIds = []; } });
+  if (Array.isArray(data.students)) {
+    const groupIdSet = new Set((Array.isArray(data.groups) ? data.groups : []).map(g => g.id));
+    data.students.forEach(s => {
+      if (!Array.isArray(s.groupIds)) s.groupIds = [];
+      if (s.groupId && !s.groupIds.includes(s.groupId)) s.groupIds.push(s.groupId);
+      delete s.groupId;
+      s.groupIds = s.groupIds.filter(gid => groupIdSet.has(gid));
+      if (!s.groupJoinedAt || typeof s.groupJoinedAt !== "object") s.groupJoinedAt = {};
+      s.groupIds.forEach(gid => { if (!s.groupJoinedAt[gid]) s.groupJoinedAt[gid] = s.joinedAt || s.createdAt || today(); });
+    });
+  }
   return data;
 }
-function saveDB() { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
+let lastBackupAt = 0;
+function saveDB(forceBackup) {
+  if (!db) return;
+  try {
+    const raw = JSON.stringify(db);
+    localStorage.setItem(DB_KEY, raw);
+    if (forceBackup || Date.now() - lastBackupAt > 300000) {
+      localStorage.setItem(DB_BACKUP_KEY, raw);
+      lastBackupAt = Date.now();
+    }
+  } catch (e) {
+    toast("Ma'lumotni saqlashda xatolik — brauzer xotirasi to'lgan bo'lishi mumkin", "err");
+  }
+}
+function saveSession(s) {
+  session = s;
+  const raw = JSON.stringify(s);
+  try { localStorage.setItem(SESSION_KEY, raw); } catch (e) {}
+  try { sessionStorage.setItem(SESSION_KEY, raw); } catch (e) {}
+}
+function clearSession() {
+  session = null;
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
+function readSession() {
+  for (const store of [localStorage, sessionStorage]) {
+    try { const raw = store.getItem(SESSION_KEY); if (raw) return JSON.parse(raw); } catch (e) {}
+  }
+  return null;
+}
 function audit(action, table, detail = "", amount = 0) {
   if (!db || !Array.isArray(db.audit)) return;
   const user = session && db.users.find(u => u.id === session.userId);
@@ -636,6 +686,20 @@ const field = (label, inner) => `<div class="f"><label>${label}</label>${inner}<
 function teacherOpts(sel) { return db.teachers.map(t => `<option value="${t.id}" ${t.id === sel ? "selected" : ""}>${esc(t.name)} — ${esc(t.subject)}</option>`).join(""); }
 function groupOpts(sel)   { return db.groups.map(g => `<option value="${g.id}" ${g.id === sel ? "selected" : ""}>${esc(g.name)} (${esc(g.subject)})</option>`).join(""); }
 function studentOpts(sel) { return realStudents().map(s => `<option value="${s.id}" ${s.id === sel ? "selected" : ""}>${esc(s.name)}</option>`).join(""); }
+function studentGroupNames(s) { return (s.groupIds || []).map(gid => groupById(gid)).filter(Boolean).map(g => g.name); }
+function assignableStudents(groupId) {
+  return realStudents().filter(s => {
+    const ids = s.groupIds || [];
+    return groupId ? !ids.includes(groupId) : ids.length === 0;
+  });
+}
+function assignStudentOpts(groupId) {
+  return assignableStudents(groupId).map(s => {
+    const others = studentGroupNames(s);
+    const suffix = groupId && others.length ? ` — ${others.join(", ")}` : "";
+    return `<option value="${s.id}">${esc(s.name + suffix)}</option>`;
+  }).join("");
+}
 
 function bindForm(id, fn) {
   const el = document.getElementById(id);
@@ -791,8 +855,8 @@ function vDashboard(role) {
       ${overdue.length ? `<table class="tbl"><thead><tr><th>O'quvchi</th><th>Guruh</th><th>Qarz</th><th>Kechikkan sana</th><th></th></tr></thead><tbody>
         ${overdue.map(s => {
           const p = studentPayments(s.id).find(x => !x.paid && x.dueDate && x.dueDate < today());
-          const g = groupById(s.groupId);
-          return `<tr><td><b>${esc(s.name)}</b></td><td>${g ? esc(g.name) : "—"}</td>
+          const gnames = studentGroupNames(s);
+          return `<tr><td><b>${esc(s.name)}</b></td><td>${gnames.length ? esc(gnames.join(", ")) : "—"}</td>
             <td><span class="badge bad">${fmtMoney(debtOf(s.id))}</span></td>
             <td>${fmtDate(p.dueDate)}</td>
             <td><button class="btn sm green" data-pay="${p.id}">To'landi</button></td></tr>`;
@@ -858,7 +922,7 @@ VIEWS.students = () => head("O'quvchilar", "O'quvchi qo'shish va boshqarish") +
     <form class="form-grid" id="studentForm">
       ${field("F.I.O", `<input id="sName" required placeholder="Ism familiya">`)}
       ${field("Telefon", `<input id="sPhone" placeholder="+998 90 123 45 67">`)}
-      ${field("Guruhlar", `<div id="sGroupCheckboxes" style="display:flex;flex-wrap:wrap;gap:8px;max-height:120px;overflow-y:auto;padding:8px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.03)">${db.groups.length ? db.groups.map(g => `<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;padding:4px 8px;border-radius:6px;transition:.15s" onmouseover="this.style.background='rgba(255,255,255,.06)'" onmouseout="this.style.background='transparent'"><input type="checkbox" value="${g.id}" style="accent-color:var(--brand)"> ${esc(g.name)}</label>`).join("") : '<span style="color:var(--muted);font-size:13px">Avval guruh yarating</span>'}</div>`)}
+      ${field("Guruhlar", `<div id="sGroupCheckboxes" style="display:flex;flex-wrap:wrap;gap:8px;max-height:120px;overflow-y:auto;padding:8px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.03)">${db.groups.length ? db.groups.map(g => `<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;padding:4px 8px;border-radius:6px;transition:.15s" onmouseover="this.style.background='rgba(255,255,255,.06)'" onmouseout="this.style.background='transparent'"><input type="checkbox" value="${g.id}" style="width:16px;height:16px;min-width:16px;margin:0;accent-color:var(--brand);cursor:pointer"> ${esc(g.name)}</label>`).join("") : '<span style="color:var(--muted);font-size:13px">Avval guruh yarating</span>'}</div>`)}
       ${field("Login", `<input id="sLogin" required placeholder="tizimga kirish logini">`)}
       ${field("Parol", `<input id="sPass" required placeholder="parol">`)}
       <button class="btn gold" type="submit">Qo'shish</button>
@@ -869,7 +933,7 @@ VIEWS.students = () => head("O'quvchilar", "O'quvchi qo'shish va boshqarish") +
     ${realStudents().length ? `<table class="tbl"><thead><tr><th>F.I.O</th><th>Telefon</th><th>Guruhlar</th><th>Login</th><th>Davomat</th><th>Qarz</th><th>Joriy oy</th><th></th></tr></thead><tbody>
       ${realStudents().map(s => { const groups = (s.groupIds || []).map(gid => groupById(gid)).filter(Boolean); const a = attStats(s.id); const d = debtOf(s.id); const curMonth = today().slice(0, 7); let totalAll = 0; groups.forEach(g => { const c = lessonCalc(s.id, curMonth, g.id); if (c) totalAll += c.total; }); return `<tr>
         <td><b style="cursor:pointer;color:var(--brand)" onclick="navigate('student-profile','${s.id}')">${esc(s.name)}</b></td><td>${esc(s.phone || "—")}</td>
-        <td>${groups.length ? groups.map(g => `<span class="badge info" style="margin:2px">${esc(g.name)}</span>`).join("") : '<span class="badge wait">guruhsiz</span>'}</td>
+        <td>${groups.length ? groups.map(g => `<span class="badge info" style="margin:2px">${esc(g.name)}</span>`).join("") : '<span class="badge wait">guruhsiz</span>'}${db.groups.length ? `<button class="btn sm ghost" data-addgroup="${s.id}" title="Guruhga qo'shish" style="height:26px;padding:2px 9px;font-size:11.5px;margin-left:6px">＋</button>` : ""}</td>
         <td>${esc(studentLogin(s))}</td>
         <td>${a.total ? `${a.pct}% <small style="color:var(--muted)">(${a.p}✓ ${a.a}✗)</small>` : "—"}</td>
         <td>${d ? `<span class="badge bad">${fmtMoney(d)}</span>` : '<span class="badge ok">yo\'q</span>'}</td>
@@ -882,11 +946,22 @@ BINDS.students = () => {
     const login = f.sLogin.value.trim().toLowerCase();
     if (db.users.some(u => u.login === login)) { toast("Bu login band!", "err"); return; }
     const groupIds = Array.from(document.querySelectorAll("#sGroupCheckboxes input:checked")).map(cb => cb.value);
-    const s = { id: uid(), name: f.sName.value.trim(), phone: f.sPhone.value.trim(), groupIds, createdAt: today() };
+    const s = { id: uid(), name: f.sName.value.trim(), phone: f.sPhone.value.trim(), groupIds, createdAt: today(), joinedAt: today() };
+    if (groupIds.length) { s.groupJoinedAt = {}; groupIds.forEach(gid => { s.groupJoinedAt[gid] = today(); }); }
     db.students.push(s);
     db.users.push({ id: uid(), login, pass: f.sPass.value.trim(), role: "student", name: s.name, refId: s.id });
-    saveDB(); toast("O'quvchi qo'shildi — login: " + login); renderMain();
+    const gnames = groupIds.map(gid => groupById(gid)).filter(Boolean).map(g => g.name);
+    saveDB(); toast("O'quvchi qo'shildi" + (gnames.length ? ` — ${gnames.join(", ")}` : "") + " — login: " + login); renderMain();
   });
+  document.querySelectorAll("[data-addgroup]").forEach(b => b.addEventListener("click", () => {
+    const s = studentById(b.dataset.addgroup);
+    if (!s) return;
+    const free = db.groups.find(g => !(s.groupIds || []).includes(g.id));
+    if (!free) { toast(`${s.name} barcha guruhlarga biriktirilgan`, "err"); return; }
+    window._sgSelectedGroup = free.id;
+    window._sgSelectedStudent = s.id;
+    navigate("student-groups");
+  }));
   bindDeletes();
 };
 
@@ -1245,16 +1320,76 @@ VIEWS.admissions = () => {
     ${field("Kelgan sana",`<input id="adDate" type="date" value="${today()}" required>`)}${field("Holat",`<select id="adStatus"><option value="new">Yangi</option><option value="waiting">Kutilmoqda</option><option value="accepted">Qabul qilindi</option><option value="rejected">Rad etildi</option></select>`)}
     <div class="full">${field("Izoh",`<textarea id="adNote"></textarea>`)}</div><button class="btn gold">Saqlash</button></form></div>
   <div class="card"><h3>Murojaatlar (${db.admissions.length})</h3>${db.admissions.length?`<table class="tbl"><thead><tr><th>F.I.O</th><th>Telefon</th><th>Kurs</th><th>Manba</th><th>Sana</th><th>Holat</th><th></th></tr></thead><tbody>${db.admissions.map(a=>`<tr><td><b>${esc(a.name)} ${esc(a.surname)}</b></td><td>${esc(a.phone)}</td><td>${esc(a.subject)}</td><td>${esc(a.source)}</td><td>${fmtDate(a.date)}</td><td><span class="badge ${a.status==="accepted"?"ok":a.status==="rejected"?"bad":"wait"}">${a.status==="accepted"?"Qabul qilindi":a.status==="rejected"?"Rad etildi":a.status==="waiting"?"Kutilmoqda":"Yangi"}</span></td><td class="act-cell">${a.status!=="accepted"?`<button class="btn sm green" data-accept-ad="${a.id}">Qabul</button>`:""}${removeBtn("admissions",a.id)}</td></tr>`).join("")}</tbody></table>`:empty("⌁","Murojaatlar mavjud emas.")}</div>
-  <div class="card"><h3>🎓 Markazga kelgan o'quvchilar (${studCount})</h3>${studCount?`<table class="tbl"><thead><tr><th>F.I.O</th><th>Telefon</th><th>Guruh</th><th>Markazga kelgan sana</th></tr></thead><tbody>${studRows.map(s=>{const g=groupById(s.groupId);return `<tr><td><b>${esc(s.name)}</b></td><td>${esc(s.phone||"—")}</td><td>${g?`<span class="badge info">${esc(g.name)}</span>`:"—"}</td><td><b>${fmtDate(s.createdAt||s.joinedAt)}</b></td></tr>`}).join("")}</tbody></table>`:empty("🎓","Hozircha o'quvchilar yo'q.")}</div>`;
+  <div class="card"><h3>🎓 Markazga kelgan o'quvchilar (${studCount})</h3>${studCount?`<table class="tbl"><thead><tr><th>F.I.O</th><th>Telefon</th><th>Guruh</th><th>Markazga kelgan sana</th></tr></thead><tbody>${studRows.map(s=>{const gs=(s.groupIds||[]).map(gid=>groupById(gid)).filter(Boolean);return `<tr><td><b>${esc(s.name)}</b></td><td>${esc(s.phone||"—")}</td><td>${gs.length?gs.map(g=>`<span class="badge info" style="margin:2px">${esc(g.name)}</span>`).join(""):"—"}</td><td><b>${fmtDate(s.createdAt||s.joinedAt)}</b></td></tr>`}).join("")}</tbody></table>`:empty("🎓","Hozircha o'quvchilar yo'q.")}</div>`;
 };
 BINDS.admissions = () => { bindForm("admissionForm",f=>addRecord("admissions",{id:uid(),name:f.adName.value.trim(),surname:f.adSurname.value.trim(),phone:f.adPhone.value.trim(),subject:f.adSubject.value.trim(),source:f.adSource.value,date:f.adDate.value,status:f.adStatus.value,note:f.adNote.value.trim()},"Murojaat qo'shildi"));document.querySelectorAll("[data-accept-ad]").forEach(b=>b.addEventListener("click",()=>{const a=db.admissions.find(x=>x.id===b.dataset.acceptAd);a.status="accepted";audit("O'zgartirildi","admissions",`${a.name} qabul qilindi`);saveDB();renderMain()}));bindRemove();};
 
 VIEWS["admission-report"] = () => { const total=db.admissions.length,accepted=db.admissions.filter(a=>a.status==="accepted").length,rejected=db.admissions.filter(a=>a.status==="rejected").length; const conversion=total?Math.round(accepted/total*100):0; const bySubject={};db.admissions.forEach(a=>bySubject[a.subject]=(bySubject[a.subject]||0)+1); return head("Qabul hisoboti","Murojaatlar konversiyasi va manbalari")+`<div class="stat-grid">${stat(total,"Jami murojaatlar")}${stat(db.admissions.filter(a=>a.status==="new").length,"Yangi")}${stat(accepted,"Qabul qilingan","green")}${stat(rejected,"Yo'qotilgan","red")}${stat(conversion+"%","Konversiya","gold")}</div><div class="card"><h3>Qaysi kursga qancha murojaat</h3>${Object.keys(bySubject).length?`<table class="tbl"><tbody>${Object.entries(bySubject).map(([k,n])=>`<tr><td><b>${esc(k)}</b></td><td>${n} ta</td></tr>`).join("")}</tbody></table>`:empty("▥","Hisobot uchun ma'lumot yo'q.")}</div>`; };
 
-VIEWS["student-groups"] = () => head("O'quvchi — Guruh biriktirish", "O'quvchini guruhga qo'shish yoki ko'chirish") +
-  `<div class="card"><form class="form-grid" id="studentGroupForm">${field("O'quvchi",`<select id="sgStudent" required><option value="">— tanlang —</option>${studentOpts()}</select>`)}${field("Guruh",`<select id="sgGroup" required><option value="">— tanlang —</option>${groupOpts()}</select>`)}${field("Kelgan sana",`<input id="sgDate" type="date" value="${today()}" required>`)}<button class="btn gold">Biriktirish</button></form></div>
-  <div class="card"><h3>Biriktirilganlar</h3>${db.students.some(s=>s.groupId)?`<table class="tbl"><thead><tr><th>O'quvchi</th><th>Guruh</th><th>Qo'shilgan sana</th><th></th></tr></thead><tbody>${db.students.filter(s=>s.groupId).map(s=>{const g=groupById(s.groupId);return `<tr><td><b>${esc(s.name)}</b></td><td>${g?esc(g.name):"—"}</td><td>${fmtDate(s.joinedAt)}</td><td><button class="btn sm red" data-unassign="${s.id}">Ajratish</button></td></tr>`}).join("")}</tbody></table>`:empty("⇄","O'quvchilar guruhga biriktirilmagan.")}</div>`;
-BINDS["student-groups"] = () => { bindForm("studentGroupForm",f=>{const s=studentById(f.sgStudent.value);s.groupId=f.sgGroup.value;s.joinedAt=f.sgDate.value;audit("O'zgartirildi","students",`${s.name} guruhga biriktirildi`);saveDB();toast("O'quvchi guruhga biriktirildi");renderMain()});document.querySelectorAll("[data-unassign]").forEach(b=>b.addEventListener("click",()=>{const s=studentById(b.dataset.unassign);s.groupId=null;audit("O'zgartirildi","students",`${s.name} guruhdan ajratildi`);saveDB();renderMain()}));};
+VIEWS["student-groups"] = () => {
+  const memberships = [];
+  realStudents().forEach(s => (s.groupIds || []).forEach(gid => {
+    const g = groupById(gid);
+    if (g) memberships.push({ s, g, date: (s.groupJoinedAt && s.groupJoinedAt[gid]) || s.joinedAt || s.createdAt || "" });
+  }));
+  memberships.sort((a, b) => a.s.name.localeCompare(b.s.name) || a.g.name.localeCompare(b.g.name));
+  const defGroup = groupById(window._sgSelectedGroup) ? window._sgSelectedGroup : (db.groups.length ? db.groups[0].id : "");
+  return head("O'quvchi — Guruh biriktirish", "O'quvchini bir yoki bir nechta guruhga biriktirish") +
+  `<div class="card">${db.groups.length ? `
+    <form class="form-grid" id="studentGroupForm">
+      ${field("Guruh", `<select id="sgGroup">${groupOpts(defGroup)}</select>`)}
+      ${field("O'quvchi", `<select id="sgStudent"><option value="">— tanlang —</option>${assignStudentOpts(defGroup)}</select>`)}
+      ${field("Kelgan sana", `<input id="sgDate" type="date" value="${today()}">`)}
+      <button class="btn gold" type="submit">Biriktirish</button>
+    </form>
+    <p id="sgHint" style="margin-top:12px;color:var(--gold);font-size:12.5px;display:none">⚠ Bu guruhga biriktirilmagan o'quvchi qolmadi. Boshqa guruhni tanlang.</p>`
+  : empty("👥", "Avval guruh yarating.")}</div>
+  <div class="card"><h3>Biriktirilganlar (${memberships.length})</h3>${memberships.length ? `<table class="tbl"><thead><tr><th>O'quvchi</th><th>Telefon</th><th>Guruh</th><th>Qo'shilgan sana</th><th></th></tr></thead><tbody>${memberships.map(m => `<tr><td><b style="cursor:pointer;color:var(--brand)" onclick="navigate('student-profile','${m.s.id}')">${esc(m.s.name)}</b></td><td>${esc(m.s.phone || "—")}</td><td><span class="badge info">${esc(m.g.name)}</span></td><td>${fmtDate(m.date)}</td><td><button class="btn sm red" data-unassign="${m.s.id}" data-group="${m.g.id}">Ajratish</button></td></tr>`).join("")}</tbody></table>` : empty("⇄", "O'quvchilar hali guruhga biriktirilmagan.")}</div>`;
+};
+BINDS["student-groups"] = () => {
+  const gSel = document.getElementById("sgGroup");
+  const sSel = document.getElementById("sgStudent");
+  const hint = document.getElementById("sgHint");
+  const refreshStudents = () => {
+    if (!gSel || !sSel) return;
+    const gid = gSel.value;
+    window._sgSelectedGroup = gid;
+    sSel.innerHTML = `<option value="">— tanlang —</option>` + assignStudentOpts(gid);
+    if (hint) hint.style.display = assignableStudents(gid).length ? "none" : "block";
+  };
+  if (gSel) { gSel.addEventListener("change", refreshStudents); refreshStudents(); }
+  if (sSel && window._sgSelectedStudent) {
+    if ([...sSel.options].some(o => o.value === window._sgSelectedStudent)) sSel.value = window._sgSelectedStudent;
+    window._sgSelectedStudent = null;
+  }
+  bindForm("studentGroupForm", f => {
+    const s = studentById(f.sgStudent.value);
+    const g = groupById(f.sgGroup.value);
+    if (!s) { toast("O'quvchini tanlang", "err"); return; }
+    if (!g) { toast("Guruhni tanlang", "err"); return; }
+    s.groupIds = Array.isArray(s.groupIds) ? s.groupIds : [];
+    if (s.groupIds.includes(g.id)) { toast(`${s.name} allaqachon "${g.name}" guruhida`, "err"); return; }
+    s.groupIds.push(g.id);
+    s.groupJoinedAt = s.groupJoinedAt || {};
+    s.groupJoinedAt[g.id] = f.sgDate.value || today();
+    if (!s.joinedAt) s.joinedAt = f.sgDate.value || today();
+    audit("O'zgartirildi", "students", `${s.name} → ${g.name} guruhiga biriktirildi`);
+    saveDB();
+    toast(`${s.name} "${g.name}" guruhiga biriktirildi`);
+    renderMain();
+  });
+  document.querySelectorAll("[data-unassign]").forEach(b => b.addEventListener("click", () => {
+    const s = studentById(b.dataset.unassign);
+    const g = groupById(b.dataset.group);
+    if (!s) return;
+    s.groupIds = (s.groupIds || []).filter(gid => gid !== b.dataset.group);
+    if (s.groupJoinedAt) delete s.groupJoinedAt[b.dataset.group];
+    audit("O'zgartirildi", "students", `${s.name} ${g ? g.name : ""} guruhidan ajratildi`);
+    saveDB();
+    toast("Guruhdan ajratildi");
+    renderMain();
+  }));
+};
 
 VIEWS.schedule = () => head("Dars jadvali", "Barcha guruhlarning dars vaqtlari") + `<div class="card">${db.groups.length?`<table class="tbl"><thead><tr><th>Guruh</th><th>Fan</th><th>Ustoz</th><th>Kunlar</th><th>Vaqt</th><th>Xona</th></tr></thead><tbody>${db.groups.map(g=>{const t=teacherById(g.teacherId);return `<tr><td><b>${esc(g.name)}</b></td><td>${esc(g.subject)}</td><td>${t?esc(t.name):"—"}</td><td>${esc(g.days||"—")}</td><td>${esc(g.time||"—")}</td><td>${esc(g.room||"—")}</td></tr>`}).join("")}</tbody></table>`:empty("▤","Dars jadvali hali tuzilmagan.")}</div>`;
 
@@ -1339,7 +1474,7 @@ BINDS["make-payment"] = () => {
 };
 VIEWS["payment-history"] = () => { const rows=db.payments.filter(p=>p.paid).sort((a,b)=>(b.payDate||"").localeCompare(a.payDate||""));return head("To'lovlar tarixi","Qabul qilingan barcha to'lovlar")+`<div class="stat-grid">${stat(fmtMoney(rows.reduce((s,p)=>s+Number(p.amount||0),0)),"Jami tushum","green")}${stat(rows.length,"To'lovlar soni")}</div><div class="card">${rows.length?`<table class="tbl"><thead><tr><th>Sana</th><th>O'quvchi</th><th>Summa</th><th>Izoh</th><th></th></tr></thead><tbody>${rows.map(p=>{const s=studentById(p.studentId);return `<tr><td>${fmtDate(p.payDate)}</td><td><b>${s?esc(s.name):"—"}</b></td><td>${fmtMoney(p.amount)}</td><td>${esc(p.note||"—")}</td><td>${removeBtn("payments",p.id)}</td></tr>`}).join("")}</tbody></table>`:empty("◴","To'lovlar tarixi bo'sh.")}</div>`};
 BINDS["payment-history"] = bindRemove;
-VIEWS["student-report"] = () => head("O'quvchi hisoboti", "O'quvchilar bo'yicha moliyaviy holat") + `<div class="card">${db.students.length?`<table class="tbl"><thead><tr><th>O'quvchi</th><th>Guruh</th><th>Hisoblangan</th><th>To'langan</th><th>Qarz</th></tr></thead><tbody>${db.students.map(s=>{const ps=studentPayments(s.id),paid=ps.filter(p=>p.paid).reduce((n,p)=>n+Number(p.amount||0),0),debt=debtOf(s.id),g=groupById(s.groupId);return `<tr><td><b>${esc(s.name)}</b></td><td>${g?esc(g.name):"—"}</td><td>${fmtMoney(paid+debt)}</td><td><span class="badge ok">${fmtMoney(paid)}</span></td><td><span class="badge ${debt?"bad":"ok"}">${fmtMoney(debt)}</span></td></tr>`}).join("")}</tbody></table>`:empty("▤","O'quvchilar yo'q.")}</div>`;
+VIEWS["student-report"] = () => head("O'quvchi hisoboti", "O'quvchilar bo'yicha moliyaviy holat") + `<div class="card">${db.students.length?`<table class="tbl"><thead><tr><th>O'quvchi</th><th>Guruh</th><th>Hisoblangan</th><th>To'langan</th><th>Qarz</th></tr></thead><tbody>${db.students.map(s=>{const ps=studentPayments(s.id),paid=ps.filter(p=>p.paid).reduce((n,p)=>n+Number(p.amount||0),0),debt=debtOf(s.id),gnames=studentGroupNames(s);return `<tr><td><b>${esc(s.name)}</b></td><td>${gnames.length?esc(gnames.join(", ")):"—"}</td><td>${fmtMoney(paid+debt)}</td><td><span class="badge ok">${fmtMoney(paid)}</span></td><td><span class="badge ${debt?"bad":"ok"}">${fmtMoney(debt)}</span></td></tr>`}).join("")}</tbody></table>`:empty("▤","O'quvchilar yo'q.")}</div>`;
 VIEWS.debtors = () => {const rows=db.students.filter(s=>debtOf(s.id)>0);return head("Qarzdorlar","To'lovi qolgan o'quvchilar")+`<div class="stat-grid">${stat(rows.length,"Qarzdorlar","red")}${stat(fmtMoney(rows.reduce((n,s)=>n+debtOf(s.id),0)),"Umumiy qarz","red")}</div><div class="card">${rows.length?`<table class="tbl"><thead><tr><th>O'quvchi</th><th>Telefon</th><th>Guruh</th><th>Qarz</th></tr></thead><tbody>${rows.map(s=>{const g=groupById(s.groupId);return `<tr><td><b>${esc(s.name)}</b></td><td>${esc(s.phone||"—")}</td><td>${g?esc(g.name):"—"}</td><td><span class="badge bad">${fmtMoney(debtOf(s.id))}</span></td></tr>`}).join("")}</tbody></table>`:empty("✓","Qarzdorlar yo'q.")}</div>`};
 VIEWS["daily-income"] = () => {const rows=db.payments.filter(p=>p.paid&&p.payDate===today()),sum=rows.reduce((n,p)=>n+Number(p.amount||0),0);return head("Kunlik tushum","Bugungi to'lovlar va kassa")+`<div class="stat-grid">${stat(fmtMoney(sum),"Bugungi tushum","green")}${stat(rows.length,"To'lovlar soni")}${stat(fmtMoney(db.expenses.filter(e=>e.date===today()).reduce((n,e)=>n+Number(e.amount||0),0)),"Bugungi xarajat","red")}</div><div class="card">${rows.length?`<table class="tbl"><tbody>${rows.map(p=>{const s=studentById(p.studentId);return `<tr><td>${s?esc(s.name):"—"}</td><td>${fmtMoney(p.amount)}</td><td>${esc(p.note||"—")}</td></tr>`}).join("")}</tbody></table>`:empty("▥","Bugun tushum bo'lmagan.")}</div>`};
 
@@ -1448,7 +1583,10 @@ function bindDeletes() {
       const rec = db.groups.find(g => g.id === id);
       if (rec) archive("groups", rec);
       db.groups = db.groups.filter(g => g.id !== id);
-      db.students.forEach(s => { if (Array.isArray(s.groupIds)) s.groupIds = s.groupIds.filter(gid => gid !== id); });
+      db.students.forEach(s => {
+        if (Array.isArray(s.groupIds)) s.groupIds = s.groupIds.filter(gid => gid !== id);
+        if (s.groupJoinedAt) delete s.groupJoinedAt[id];
+      });
       db.homework = db.homework.filter(h => h.groupId !== id);
       db.attendance = db.attendance.filter(a => a.groupId !== id);
     } else if (del === "homework") {
@@ -2080,7 +2218,7 @@ function renderMain() {
       group.items.push(item);
     });
     const activeItem = menu.find(item => item[0] === currentView);
-    if (!openNavGroup && activeItem?.[3]) openNavGroup = activeItem[3];
+    if (!navGroupInitDone) { openNavGroup = activeItem?.[3] || ""; navGroupInitDone = true; }
     sideNav.innerHTML = standalone.map(navItem).join("") + groups.map(group => {
       const open = openNavGroup === group.name;
       return `<div class="nav-group ${open ? "open" : ""}">
@@ -2092,7 +2230,12 @@ function renderMain() {
     }).join("");
     sideNav.querySelectorAll(".nav-group-toggle").forEach(b => b.addEventListener("click", () => {
       openNavGroup = openNavGroup === b.dataset.navGroup ? "" : b.dataset.navGroup;
-      renderMain();
+      sideNav.querySelectorAll(".nav-group").forEach(g => {
+        const btn = g.querySelector(".nav-group-toggle");
+        const isOpen = !!btn && btn.dataset.navGroup === openNavGroup;
+        g.classList.toggle("open", isOpen);
+        if (btn) btn.setAttribute("aria-expanded", String(isOpen));
+      });
     }));
   } else {
     sideNav.innerHTML = menu.map(navItem).join("");
@@ -2131,6 +2274,8 @@ function enterApp() {
   document.getElementById("loginScreen").style.display = "none";
   document.getElementById("appScreen").classList.add("show");
   currentView = "";
+  openNavGroup = "";
+  navGroupInitDone = false;
   renderMain();
 }
 
@@ -2158,8 +2303,7 @@ function attemptLogin() {
   db.loginHistory.unshift({ id: uid(), at: new Date().toISOString(), login: u.login, name: u.name, role: u.role, ok: true });
   if (db.loginHistory.length > 500) db.loginHistory.length = 500;
   saveDB();
-  session = { userId: u.id };
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  saveSession({ userId: u.id });
   document.getElementById("succTitle").textContent = `Xush kelibsiz, ${u.name}!`;
   document.getElementById("successOverlay").classList.add("show");
   setTimeout(() => {
@@ -2169,8 +2313,7 @@ function attemptLogin() {
 }
 
 function logout() {
-  session = null;
-  sessionStorage.removeItem(SESSION_KEY);
+  clearSession();
   document.getElementById("appScreen").classList.remove("show");
   document.getElementById("loginScreen").style.display = "grid";
   document.getElementById("loginPass").value = "";
@@ -2179,7 +2322,7 @@ function logout() {
 /* ---------------- init ---------------- */
 function init() {
   db = loadDB();
-  saveDB();
+  saveDB(true);
 
   document.getElementById("loginBtn").addEventListener("click", attemptLogin);
   document.getElementById("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") attemptLogin(); });
@@ -2190,13 +2333,15 @@ function init() {
   });
   document.getElementById("logoutBtn").addEventListener("click", logout);
 
+  /* ma'lumotlarni sahifa yopilishida ham saqlab qolish */
+  window.addEventListener("pagehide", () => { if (db) saveDB(); });
+  window.addEventListener("beforeunload", () => { if (db) saveDB(); });
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && db) saveDB(); });
+
   /* auto-login from session */
   try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
-    if (raw) {
-      const s = JSON.parse(raw);
-      if (s && db.users.some(u => u.id === s.userId)) { session = s; enterApp(); return; }
-    }
+    const s = readSession();
+    if (s && s.userId && db.users.some(u => u.id === s.userId)) { session = s; enterApp(); return; }
   } catch (e) {}
 }
 init();
